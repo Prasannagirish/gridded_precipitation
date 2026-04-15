@@ -1,0 +1,56 @@
+# ═══════════════════════════════════════════════════════════
+#  FlowCast v2 — Requirements
+#  Kabini River Basin Discharge Prediction Pipeline
+# ═══════════════════════════════════════════════════════════
+#
+#  Install:  pip install -r requirements.txt
+#
+#  For CMIP6 download extras:
+#    pip install -r requirements.txt ".[cmip6]"
+#  Or just:
+#    pip install intake intake-esm gcsfs zarr dask[array] rioxarray
+# ═══════════════════════════════════════════════════════════
+
+# ── Core Scientific Stack ─────────────────────────────────
+numpy>=1.24,<2.0
+pandas>=2.0
+scipy>=1.10
+
+# ── ML / Traditional Models ──────────────────────────────
+scikit-learn>=1.3
+joblib>=1.3
+xgboost>=2.0                  # optional: native XGBoost (pipeline uses GradientBoostingRegressor as fallback)
+
+# ── Deep Learning ────────────────────────────────────────
+torch>=2.0
+
+# ── Geospatial / Shapefile ───────────────────────────────
+geopandas>=0.14
+shapely>=2.0
+pyproj>=3.6
+fiona>=1.9
+
+# ── Climate / NetCDF ─────────────────────────────────────
+xarray>=2023.6
+netCDF4>=1.6
+
+# ── CMIP6 Download (Pangeo Cloud) ───────────────────────
+intake>=0.7
+intake-esm>=2023.7
+gcsfs>=2023.6
+fsspec>=2023.6
+zarr>=2.14
+dask[array]>=2023.6
+
+# ── CMIP6 Spatial Clipping (exact basin masking) ────────
+rioxarray>=0.15
+rasterio>=1.3
+
+# ── Dashboard ────────────────────────────────────────────
+streamlit>=1.28
+plotly>=5.15
+matplotlib>=3.7
+seaborn>=0.12
+# ── Bias Correction (optional alternative to built-in) ──
+# python-cmethods>=2.0        # uncomment if you want CMethods as alternative to built-in QDM
+# xclim>=0.47                 # uncomment for xclim.sdba bias correction suite

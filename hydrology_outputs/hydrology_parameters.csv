@@ -1,0 +1,22 @@
+Parameter,Value
+Catchment area (km²),2100
+Record period,1990-01-01 to 2020-12-30
+Mean annual rainfall (mm),11820.063122974769
+Mean annual runoff (mm),1183.7724434908496
+Runoff coefficient (C),0.10014712050363807
+Baseflow Index (BFI),0.75953946797327
+Recession constant (k),0.8781058672243032
+Recession half-life (days),5.332388895944398
+SCS Curve Number (CN),60.33254156769596
+Potential max retention S (mm),167.0
+UH Time to peak Tp (days),0.9696594153316894
+UH Peak Qp (m³/s/mm),387.1205
+UH Time base Tb (days),3.1212074269164614
+UH Lag time (days),1.0
+Tc Kirpich (hours),13.7
+Q50 median flow (m³/s),21.101473
+Q90 low flow (m³/s),2.473
+Q95 drought flow (m³/s),1.4482000000000008
+Mean discharge (m³/s),78.77933700781487
+Max discharge (m³/s),2357.0
+Min discharge (m³/s),0.0
