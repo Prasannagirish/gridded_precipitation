@@ -1,7 +1,6 @@
 """
 FlowCast v2 — Main Pipeline
 Orchestrates: Data → Features → Model Training → Evaluation → Climate Projections
-Saves: models, predictions, per-model plots, hydrological analyses, CMIP6 results
 """
 import sys
 import json
@@ -10,14 +9,18 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 from sklearn.preprocessing import StandardScaler
-import joblib
+
+# Enable KML support for geopandas (prevents shapefile read errors downstream)
+import fiona
+fiona.drvsupport.supported_drivers['KML'] = 'rw'
+fiona.drvsupport.supported_drivers['LIBKML'] = 'rw'
 
 # Ensure project root is on path
 ROOT = Path(__file__).parent
 sys.path.insert(0, str(ROOT))
 
-from modules.config import data_cfg, model_cfg, climate_cfg, basin_cfg, MODEL_DIR, OUTPUT_DIR
-from modules.loader import KabiniDataLoader, train_val_test_split
+from modules.config import data_cfg, model_cfg, climate_cfg, basin_cfg
+from modules.loader import KabiniDataLoader
 from modules.engineer import (
     HydroFeatureEngineer, select_features,
     create_sequences, create_sequences_with_static,
@@ -29,46 +32,34 @@ from modules.deep_learning import (
 )
 from modules.ensemble import WeightedEnsemble, StackingEnsemble
 from modules.metrics import evaluate_all, evaluate_flow_regimes
+from modules.cmip6_projector import CMIP6RealProjector as CMIP6Projector    
 from modules.hydro import (
     eckhardt_baseflow, gumbel_flood_frequency,
     compute_hydrological_signatures, flow_duration_curve,
+    run_advanced_catchment_analysis 
 )
-from modules.visualization import (
-    plot_model_hydrograph,
-    plot_model_scatter,
-    plot_scatter_predictions,
-    plot_best_hydrograph,
-    plot_error_violin,
-    plot_eckhardt_filter,
-    plot_flow_duration_curve,
-    plot_flood_frequency,
-    plot_cmip6_projections,
-    plot_cmip6_ensemble_summary,
-)
+from modules import visualization as vis
 
 
 def run_pipeline(
-    use_synthetic: bool = True,
-    precip_path: str = None,
-    discharge_path: str = None,
+    use_synthetic: bool = False,
+    precip_path: str = "/Users/girish/cs101/projects/gridded_precip/gridded_precipitation/data/chirps_kabini_daily.csv",
+    discharge_path: str = "/Users/girish/cs101/projects/gridded_precip/gridded_precipitation/data/discharge_daily_observed.csv",
     temp_path: str = None,
     feature_combo: str = "M1_full",
     run_traditional: bool = True,
     run_deep: bool = True,
     run_climate: bool = True,
-    use_real_cmip6: bool = None,
-    cmip6_dir: str = None,
     pso_particles: int = 15,
     pso_iterations: int = 30,
     dl_epochs: int = 80,
     seq_length: int = 30,
 ):
-    results = {"models": {}, "ensemble": {}, "climate": {}, "hydrology": {}}
+    """
+    Execute the complete FlowCast v2 pipeline.
+    """
+    results = {"models": {}, "ensemble": {}, "climate": {}}
     start_time = time.time()
-    output_dir = str(OUTPUT_DIR)
-
-    if use_real_cmip6 is None:
-        use_real_cmip6 = climate_cfg.use_real_cmip6
 
     # ═══════════════════════════════════════════════════════════
     # STEP 1: Load Data
@@ -80,11 +71,60 @@ def run_pipeline(
     loader = KabiniDataLoader()
     if use_synthetic:
         raw_df = loader.generate_synthetic_data()
-        print(f"  Generated synthetic data: {raw_df.shape[0]} days "
-              f"({raw_df.index[0].date()} to {raw_df.index[-1].date()})")
+        print(f"  Generated synthetic data: {raw_df.shape[0]} days")
     else:
-        raw_df = loader.load_real_data(precip_path, discharge_path, temp_path)
-        print(f"  Loaded real data: {raw_df.shape[0]} days")
+        # --- CUSTOM DATA LOADER FOR SPECIFIC CSV FORMATS ---
+        print("  Parsing custom CSV formats...")
+        
+        # 1. Read Precipitation (using rainfall_mean_mm)
+        df_p = pd.read_csv(precip_path)
+        df_p['date'] = pd.to_datetime(df_p['date'])
+        df_p = df_p.set_index('date')
+        df_p = df_p[['rainfall_mean_mm']].rename(columns={'rainfall_mean_mm': 'precip'})
+        
+        # 2. Read Discharge (using q_upstream_mk)
+        df_q = pd.read_csv(discharge_path)
+        df_q['date'] = pd.to_datetime(df_q['date'])
+        df_q = df_q.set_index('date')
+        df_q = df_q[['q_upstream_mk']].rename(columns={'q_upstream_mk': 'discharge'})
+
+        # 3. Merge observations together
+        raw_df = df_p.join(df_q, how='inner').sort_index()
+
+        # 4. INJECT REALISTIC TEMPERATURES FROM CMIP6 MIROC6
+        print("  Injecting temperature proxies from MIROC6 GCM...")
+        try:
+            # Paths to the MIROC6 data you just downloaded
+            miroc_hist = Path(climate_cfg.cmip6_download_dir) /"historical"/ "MIROC6_historical_daily.csv"
+            miroc_fut  = Path(climate_cfg.cmip6_download_dir) /"ssp245"/"MIROC6_ssp245_daily.csv"
+
+            # Read tmax and tmin (using index_col=0 as we figured out earlier!)
+            df_t_hist = pd.read_csv(miroc_hist, index_col=0, parse_dates=True)[['tmax', 'tmin']]
+            df_t_fut  = pd.read_csv(miroc_fut, index_col=0, parse_dates=True)[['tmax', 'tmin']]
+            
+            # Combine 1990-2014 (historical) and 2015-2020 (SSP245) to cover your full training period
+            df_t_combined = pd.concat([df_t_hist, df_t_fut])
+            df_t_combined = df_t_combined[~df_t_combined.index.duplicated(keep='first')]
+            
+            # Join the temperatures onto your raw observations
+            raw_df = raw_df.join(df_t_combined, how='left')
+            
+            # Fill any missing days (like leap days if the GCM uses a 365-day calendar)
+            raw_df['tmax'] = raw_df['tmax'].ffill().bfill()
+            raw_df['tmin'] = raw_df['tmin'].ffill().bfill()
+            
+        except Exception as e:
+            print(f"  ⚠ Could not load MIROC6 temperatures: {e}")
+            print("  Falling back to seasonal sine-wave approximation.")
+            # Fallback if files aren't found: A sine wave mimicking the Kabini basin climate
+            doy = raw_df.index.dayofyear
+            raw_df["tmax"] = 30.0 + 5.0 * np.sin(2 * np.pi * (doy - 100) / 365)
+            raw_df["tmin"] = 20.0 + 3.0 * np.sin(2 * np.pi * (doy - 100) / 365)
+
+        # Final cleanup for any lingering NaNs
+        raw_df = raw_df.ffill().bfill() 
+        print(f"  Loaded real data: {raw_df.shape[0]} days "
+              f"({raw_df.index[0].date()} to {raw_df.index[-1].date()})")
 
     static_features = loader.get_static_features()
     static_array = np.array(list(static_features.values()), dtype=np.float32)
@@ -94,7 +134,6 @@ def run_pipeline(
     signatures = compute_hydrological_signatures(
         raw_df["discharge"].values, raw_df["precip"].values
     )
-    results["hydrology"]["signatures"] = signatures
     print(f"\n  Hydrological Signatures:")
     for k, v in signatures.items():
         print(f"    {k}: {v}")
@@ -103,9 +142,6 @@ def run_pipeline(
     baseflow, quickflow = eckhardt_baseflow(raw_df["discharge"].values)
     raw_df["baseflow"] = baseflow
     raw_df["quickflow"] = quickflow
-
-    # Save raw data summary for dashboard
-    raw_df.to_csv(OUTPUT_DIR / "raw_data_summary.csv")
 
     # ═══════════════════════════════════════════════════════════
     # STEP 2: Feature Engineering
@@ -116,16 +152,14 @@ def run_pipeline(
 
     engineer = HydroFeatureEngineer(raw_df)
     df = engineer.build_all_features()
-    print(f"  Total features generated: {df.shape[1]}")
-
-    feature_list = data_cfg.feature_combinations.get(
-        feature_combo, data_cfg.feature_combinations["M1_full"]
-    )
+    
+    feature_list = data_cfg.feature_combinations.get(feature_combo, data_cfg.feature_combinations["M1_full"])
+    # Drop rows with NaNs resulting from lags/rolling windows before selecting features
+    df = df.dropna()
     df_features = select_features(df, feature_list)
     target = df["discharge"]
 
     print(f"  Selected combo: {feature_combo} ({df_features.shape[1]} features)")
-    print(f"  Features: {list(df_features.columns)}")
 
     # ═══════════════════════════════════════════════════════════
     # STEP 3: Train/Val/Test Split
@@ -159,10 +193,6 @@ def run_pipeline(
     all_val_preds = {}
     all_test_preds = {}
 
-    # Keep track of observation arrays per model (DL models use sequence-trimmed obs)
-    test_obs_per_model = {}
-    test_dates_per_model = {}
-
     # ═══════════════════════════════════════════════════════════
     # STEP 4A: Traditional ML Models (PSO-optimized)
     # ═══════════════════════════════════════════════════════════
@@ -186,12 +216,7 @@ def run_pipeline(
         }
         all_val_preds["RF-PSO"] = rf_val_pred
         all_test_preds["RF-PSO"] = rf_test_pred
-        test_obs_per_model["RF-PSO"] = y_test_np
-        test_dates_per_model["RF-PSO"] = test_X.index
-        # Save model
-        rf.save(MODEL_DIR / "rf_pso.joblib")
         print(f"\n  RF-PSO Test: {results['models']['RF-PSO']['test']}")
-        print(f"  ✓ Model saved → {MODEL_DIR / 'rf_pso.joblib'}")
 
         # --- SVR-PSO ---
         svr = SVRModel()
@@ -207,11 +232,7 @@ def run_pipeline(
         }
         all_val_preds["SVR-PSO"] = svr_val_pred
         all_test_preds["SVR-PSO"] = svr_test_pred
-        test_obs_per_model["SVR-PSO"] = y_test_np
-        test_dates_per_model["SVR-PSO"] = test_X.index
-        svr.save(MODEL_DIR / "svr_pso.joblib")
         print(f"\n  SVR-PSO Test: {results['models']['SVR-PSO']['test']}")
-        print(f"  ✓ Model saved → {MODEL_DIR / 'svr_pso.joblib'}")
 
         # --- XGBoost-PSO ---
         xgb = XGBoostModel()
@@ -227,11 +248,7 @@ def run_pipeline(
         }
         all_val_preds["XGBoost-PSO"] = xgb_val_pred
         all_test_preds["XGBoost-PSO"] = xgb_test_pred
-        test_obs_per_model["XGBoost-PSO"] = y_test_np
-        test_dates_per_model["XGBoost-PSO"] = test_X.index
-        xgb.save(MODEL_DIR / "xgb_pso.joblib")
         print(f"\n  XGBoost-PSO Test: {results['models']['XGBoost-PSO']['test']}")
-        print(f"  ✓ Model saved → {MODEL_DIR / 'xgb_pso.joblib'}")
 
     # ═══════════════════════════════════════════════════════════
     # STEP 4B: Deep Learning Models
@@ -253,18 +270,9 @@ def run_pipeline(
 
         n_features = X_train_s.shape[1]
 
-        # Save scalers for later use
-        joblib.dump({"scaler_X": scaler_X, "scaler_y": scaler_y}, MODEL_DIR / "dl_scalers.joblib")
-
-        # Create sequences
         Xtr_seq, ytr_seq = create_sequences(X_train_s, y_train_s, seq_length)
         Xv_seq, yv_seq = create_sequences(X_val_s, y_val_s, seq_length)
         Xt_seq, yt_seq = create_sequences(X_test_s, y_test_s, seq_length)
-
-        y_val_seq_real = scaler_y.inverse_transform(yv_seq.reshape(-1, 1)).ravel()
-        y_test_seq_real = scaler_y.inverse_transform(yt_seq.reshape(-1, 1)).ravel()
-        # Dates for sequence-based models (trimmed by seq_length from the front)
-        test_dates_seq = test_X.index[seq_length:]
 
         # --- Standard LSTM ---
         print("\n  Training Standard LSTM...")
@@ -291,17 +299,16 @@ def run_pipeline(
         lstm_val_pred = scaler_y.inverse_transform(lstm_val_pred_s.reshape(-1, 1)).ravel()
         lstm_test_pred = scaler_y.inverse_transform(lstm_test_pred_s.reshape(-1, 1)).ravel()
 
+        y_val_seq_real = scaler_y.inverse_transform(yv_seq.reshape(-1, 1)).ravel()
+        y_test_seq_real = scaler_y.inverse_transform(yt_seq.reshape(-1, 1)).ravel()
+
         results["models"]["LSTM"] = {
             "val": evaluate_all(y_val_seq_real, lstm_val_pred),
             "test": evaluate_all(y_test_seq_real, lstm_test_pred),
         }
         all_val_preds["LSTM"] = lstm_val_pred
         all_test_preds["LSTM"] = lstm_test_pred
-        test_obs_per_model["LSTM"] = y_test_seq_real
-        test_dates_per_model["LSTM"] = test_dates_seq[:len(lstm_test_pred)]
-        lstm_trainer.save(MODEL_DIR / "lstm.pt")
         print(f"\n  LSTM Test: {results['models']['LSTM']['test']}")
-        print(f"  ✓ Model saved → {MODEL_DIR / 'lstm.pt'}")
 
         # --- Physics-Informed LSTM ---
         print("\n  Training Physics-Informed LSTM...")
@@ -337,18 +344,13 @@ def run_pipeline(
         }
         all_val_preds["PI-LSTM"] = pi_val_pred
         all_test_preds["PI-LSTM"] = pi_test_pred
-        test_obs_per_model["PI-LSTM"] = y_test_seq_real
-        test_dates_per_model["PI-LSTM"] = test_dates_seq[:len(pi_test_pred)]
-        pi_trainer.save(MODEL_DIR / "pi_lstm.pt")
         print(f"\n  PI-LSTM Test: {results['models']['PI-LSTM']['test']}")
-        print(f"  ✓ Model saved → {MODEL_DIR / 'pi_lstm.pt'}")
 
-        # --- Adapted GRU (Paper 3) ---
+        # --- Adapted GRU ---
         print("\n  Training A-GRU...")
         static_scaler = StandardScaler()
         static_scaled = static_scaler.fit_transform(static_array.reshape(1, -1)).flatten()
         n_static = len(static_scaled)
-        joblib.dump(static_scaler, MODEL_DIR / "static_scaler.joblib")
 
         Xtr_d, Xtr_s, ytr_agru = create_sequences_with_static(
             X_train_s, static_scaled, y_train_s, seq_length
@@ -373,15 +375,9 @@ def run_pipeline(
             model_name="A-GRU",
         )
 
-        agru_train_loader = build_agru_dataloader(
-            Xtr_d, Xtr_s, ytr_agru, model_cfg.agru_batch_size, shuffle=True
-        )
-        agru_val_loader = build_agru_dataloader(
-            Xv_d, Xv_s, yv_agru, model_cfg.agru_batch_size, shuffle=False
-        )
-        agru_test_loader = build_agru_dataloader(
-            Xt_d, Xt_s, yt_agru, model_cfg.agru_batch_size, shuffle=False
-        )
+        agru_train_loader = build_agru_dataloader(Xtr_d, Xtr_s, ytr_agru, model_cfg.agru_batch_size, shuffle=True)
+        agru_val_loader = build_agru_dataloader(Xv_d, Xv_s, yv_agru, model_cfg.agru_batch_size, shuffle=False)
+        agru_test_loader = build_agru_dataloader(Xt_d, Xt_s, yt_agru, model_cfg.agru_batch_size, shuffle=False)
 
         agru_trainer.train(agru_train_loader, agru_val_loader, epochs=dl_epochs)
 
@@ -399,11 +395,7 @@ def run_pipeline(
         }
         all_val_preds["A-GRU"] = agru_val_pred
         all_test_preds["A-GRU"] = agru_test_pred
-        test_obs_per_model["A-GRU"] = y_test_agru_real
-        test_dates_per_model["A-GRU"] = test_dates_seq[:len(agru_test_pred)]
-        agru_trainer.save(MODEL_DIR / "agru.pt")
         print(f"\n  A-GRU Test: {results['models']['A-GRU']['test']}")
-        print(f"  ✓ Model saved → {MODEL_DIR / 'agru.pt'}")
 
     # ═══════════════════════════════════════════════════════════
     # STEP 5: Ensemble
@@ -419,10 +411,9 @@ def run_pipeline(
         val_preds_trimmed = {k: v[:min_val_len] for k, v in all_val_preds.items()}
         test_preds_trimmed = {k: v[:min_test_len] for k, v in all_test_preds.items()}
 
-        y_val_ens = y_val_np[:min_val_len] if run_traditional else y_val_seq_real[:min_val_len]
-        y_test_ens = y_test_np[:min_test_len] if run_traditional else y_test_seq_real[:min_test_len]
+        y_val_ens = y_val_np[-min_val_len:]
+        y_test_ens = y_test_np[-min_test_len:]
 
-        # Weighted ensemble
         weighted_ens = WeightedEnsemble()
         weighted_ens.fit(val_preds_trimmed, y_val_ens, method="optimize")
         ens_val_pred = weighted_ens.predict(val_preds_trimmed)
@@ -435,7 +426,6 @@ def run_pipeline(
         }
         print(f"\n  Weighted Ensemble Test: {results['ensemble']['weighted']['test']}")
 
-        # Stacking ensemble
         stacking = StackingEnsemble()
         stacking.fit(val_preds_trimmed, y_val_ens)
         stack_test_pred = stacking.predict(test_preds_trimmed)
@@ -455,8 +445,24 @@ def run_pipeline(
     if len(annual_max) >= 5:
         flood_freq = gumbel_flood_frequency(annual_max)
         results["flood_frequency"] = flood_freq
-        results["hydrology"]["annual_max"] = annual_max.tolist()
         print(f"  Gumbel flood frequencies: {flood_freq}")
+
+    # ═══════════════════════════════════════════════════════════
+    # FIND BEST TRADITIONAL MODEL (For Climate & Feature Importance)
+    # ═══════════════════════════════════════════════════════════
+    best_model = None
+    best_model_name = None
+    if run_traditional:
+        best_nse = -np.inf
+        for name in ["RF-PSO", "SVR-PSO", "XGBoost-PSO"]:
+            if name in results["models"]:
+                test_nse = results["models"][name]["test"]["NSE"]
+                if test_nse > best_nse:
+                    best_nse = test_nse
+                    best_model_name = name
+                    if name == "RF-PSO": best_model = rf
+                    elif name == "SVR-PSO": best_model = svr
+                    else: best_model = xgb
 
     # ═══════════════════════════════════════════════════════════
     # STEP 7: Climate Projections
@@ -466,335 +472,162 @@ def run_pipeline(
         print("  STEP 7: CMIP6 CLIMATE PROJECTIONS")
         print("═" * 70)
 
-        # Select best traditional model for projections
-        best_model = None
-        best_model_name = None
-        if run_traditional:
-            best_nse = -np.inf
-            for name in ["RF-PSO", "SVR-PSO", "XGBoost-PSO"]:
-                if name in results["models"]:
-                    test_nse = results["models"][name]["test"]["NSE"]
-                    if test_nse > best_nse:
-                        best_nse = test_nse
-                        best_model_name = name
-                        if name == "RF-PSO":
-                            best_model = rf
-                        elif name == "SVR-PSO":
-                            best_model = svr
-                        else:
-                            best_model = xgb
+        try:
+            projector = CMIP6Projector(
+                cmip6_dir=climate_cfg.cmip6_download_dir,
+                gcm_models=climate_cfg.gcm_models,
+                obs_df=raw_df,
+                feature_columns=list(df_features.columns),
+                scenarios=climate_cfg.scenarios,
+                future_periods=climate_cfg.future_periods,
+            )
 
-        if best_model is None:
-            print("  ✗ No trained model available for projections")
-
-        # ── MODE A: Real CMIP6 data with QDM bias correction ──
-        elif use_real_cmip6:
-            print(f"\n  Mode: REAL CMIP6 data with Quantile Delta Mapping")
-            print(f"  Using {best_model_name} for discharge projections")
-
-            cmip6_path = cmip6_dir or climate_cfg.cmip6_download_dir
-            cmip6_path = Path(cmip6_path)
-
-            if not cmip6_path.exists():
-                print(f"\n  ✗ CMIP6 download directory not found: {cmip6_path}")
-                print(f"    Run the downloader first:")
-                print(f"      python cmip6.py --shapefile {climate_cfg.basin_shapefile}")
-                print(f"\n  Falling back to synthetic delta-change method...")
-                use_real_cmip6 = False
-            else:
-                from modules.cmip6_projector import CMIP6RealProjector
-
-                projector = CMIP6RealProjector(
-                    cmip6_dir=str(cmip6_path),
-                    obs_df=raw_df,
-                    feature_columns=list(df_features.columns),
-                    gcm_models=climate_cfg.gcm_models,
-                    scenarios=climate_cfg.scenarios,
-                    future_periods=climate_cfg.future_periods,
-                    baseline_period=(
-                        f"{climate_cfg.baseline_period[0]}-01-01",
-                        f"{climate_cfg.baseline_period[1]}-12-31",
-                    ),
-                    n_quantiles=climate_cfg.n_quantiles,
-                )
-
-                projector.fit_bias_correction()
-                projector.generate_corrected_futures()
-
-                all_projections = projector.generate_all_scenarios(
-                    trained_model=best_model,
-                )
+            if best_model is not None:
+                print(f"\n  Using {best_model_name} for climate projections")
+                all_projections = projector.generate_all_scenarios(best_model)
 
                 if all_projections:
                     summary = projector.summarize_projections(
                         all_projections, raw_df["discharge"].values
                     )
                     results["climate"]["projections"] = summary.to_dict("records")
-
-                    ensemble_summary = projector.generate_ensemble_summary(all_projections)
-                    results["climate"]["ensemble_summary"] = ensemble_summary.to_dict("records")
-
-                    projector.save_projections(
-                        all_projections,
-                        output_dir=str(ROOT / "outputs"),
-                    )
-
-                    print(f"\n  ── Per-GCM Projection Summary ──")
+                    print(f"\n  Climate Projection Summary:")
                     print(summary.to_string(index=False))
-                    print(f"\n  ── Ensemble Summary ──")
-                    print(ensemble_summary.to_string(index=False))
-
-                    results["climate"]["bias_correction"] = {
-                        gcm: bc.summary().to_dict("records")
-                        for gcm, bc in projector.bias_correctors.items()
-                    }
-
-                    # Generate CMIP6 plots
-                    baseline_mean = float(np.mean(raw_df["discharge"].values))
-                    plot_cmip6_projections(summary, baseline_mean, output_dir=output_dir)
-                    plot_cmip6_ensemble_summary(ensemble_summary, output_dir=output_dir)
-                    print("  ✓ Saved CMIP6 projection plots")
                 else:
-                    print("  ✗ No valid projections generated")
-
-        # ── MODE B: Synthetic delta-change (fallback) ──
-        if not use_real_cmip6 and best_model is not None:
-            print(f"\n  Mode: SYNTHETIC delta-change (legacy)")
-            print(f"  Using {best_model_name} for climate projections")
-
-            from modules.cmip6_projector import CMIP6RealProjector
-
-            # Generate synthetic CMIP6-style projections for demo
-            print("  Generating synthetic climate scenarios for demonstration...")
-
-            # Create synthetic future scenarios from observed data
-            baseline_discharge = raw_df["discharge"].values
-            baseline_mean = float(np.mean(baseline_discharge))
-            results["climate"]["baseline_mean_q"] = baseline_mean
-            results["climate"]["projection_model"] = best_model_name
-
-            # Synthetic delta changes for demonstration
-            synthetic_projections = []
-            for ssp, ssp_label in [("ssp245", "SSP2-4.5"), ("ssp585", "SSP5-8.5")]:
-                for yr_start, yr_end in climate_cfg.future_periods:
-                    # Approximate temperature-driven changes
-                    if ssp == "ssp245":
-                        delta_pct = np.random.uniform(5, 20) * ((yr_start - 2020) / 70)
-                    else:
-                        delta_pct = np.random.uniform(10, 35) * ((yr_start - 2020) / 70)
-
-                    future_mean = baseline_mean * (1 + delta_pct / 100)
-                    synthetic_projections.append({
-                        "GCM": "Synthetic-Ensemble",
-                        "SSP": ssp,
-                        "Period": f"{yr_start}-{yr_end}",
-                        "Mean_Q": round(future_mean, 2),
-                        "Change_pct": round(delta_pct, 1),
-                        "Max_Q": round(future_mean * 3.5, 2),
-                        "Min_Q": round(future_mean * 0.1, 2),
-                        "Std_Q": round(future_mean * 0.8, 2),
-                        "Q10": round(future_mean * 0.2, 2),
-                        "Q50": round(future_mean * 0.6, 2),
-                        "Q90": round(future_mean * 2.5, 2),
-                    })
-
-            summary_df = pd.DataFrame(synthetic_projections)
-            results["climate"]["projections"] = summary_df.to_dict("records")
-            print(f"\n  Synthetic Climate Projection Summary:")
-            print(summary_df.to_string(index=False))
-
-            # Generate CMIP6 plots
-            plot_cmip6_projections(summary_df, baseline_mean, output_dir=output_dir)
-            print("  ✓ Saved CMIP6 projection plots")
+                    print("  ⚠ No projections generated.")
+        except Exception as e:
+            print(f"  ⚠ Climate projection skipped: {e}")
 
     # ═══════════════════════════════════════════════════════════
-    # STEP 8: Flow Regime Analysis
+    # STEP 8: FLOW REGIME ANALYSIS
     # ═══════════════════════════════════════════════════════════
     print("\n" + "═" * 70)
     print("  STEP 8: FLOW REGIME ANALYSIS")
     print("═" * 70)
 
-    for model_name in list(results["models"].keys()):
+    for model_name in list(results["models"].keys())[:3]:
         if model_name in all_test_preds:
             pred = all_test_preds[model_name]
-            obs = test_obs_per_model.get(model_name, y_test_np[:len(pred)])
-            obs = obs[:len(pred)]
+            obs = y_test_np[-len(pred):]
             regime_results = evaluate_flow_regimes(obs, pred)
             results["models"][model_name]["flow_regimes"] = {
                 k: v for k, v in regime_results.items()
             }
-            print(f"\n  {model_name} flow regime performance:")
-            for regime, metrics in regime_results.items():
-                print(f"    {regime}: NSE={metrics.get('NSE', 'N/A')}, KGE={metrics.get('KGE', 'N/A')}")
 
     # ═══════════════════════════════════════════════════════════
-    # STEP 9: GENERATE ALL VISUALIZATIONS
+    # STEP 9: VISUALIZATIONS  
     # ═══════════════════════════════════════════════════════════
     print("\n" + "═" * 70)
-    print("  STEP 9: GENERATING ALL PLOTS")
+    print("  STEP 9: GENERATING VISUALIZATIONS")
     print("═" * 70)
+    
+    # We use the trimmed dates to ensure DL models and Traditional models align perfectly
+    if len(all_test_preds) > 0:
+        min_test_len = min(len(v) for v in all_test_preds.values())
+        test_dates = test_X.index[-min_test_len:]
+        y_test_ens = y_test_np[-min_test_len:]
+        test_preds_trimmed = {k: v[-min_test_len:] for k, v in all_test_preds.items()}
+        
+        # ─── HYDROLOGICAL OUTPUTS ──────────────────────────────────
+        hydro_out_dir = str(ROOT / "hydrological_outputs")
 
-    # --- 1. Eckhardt Baseflow Separation (1-year slice for readability) ---
-    plot_start = "2019-01-01"
-    plot_end = "2019-12-31"
-    if raw_df.index[-1] < pd.Timestamp(plot_start):
-        # Use last year of data if 2019 not available
-        plot_end_date = raw_df.index[-1]
-        plot_start_date = plot_end_date - pd.DateOffset(years=1)
-        slice_df = raw_df.loc[plot_start_date:plot_end_date]
-    else:
-        slice_df = raw_df.loc[plot_start:plot_end]
-
-    if len(slice_df) > 0:
-        plot_eckhardt_filter(
-            dates=slice_df.index,
-            precip=slice_df["precip"].values,
-            discharge=slice_df["discharge"].values,
-            baseflow=slice_df["baseflow"].values,
-            output_dir=output_dir,
+        # 1. Baseflow Separation Plot (Using full dataset)
+        vis.plot_eckhardt_filter(
+            raw_df.index, raw_df["precip"], raw_df["discharge"], raw_df["baseflow"],
+            output_dir=hydro_out_dir
         )
-        print("  ✓ Saved Eckhardt baseflow separation plot (inverted rainfall)")
+        print("  ✓ Baseflow separation plotted")
 
-    # --- 2. Flow Duration Curve ---
-    plot_flow_duration_curve(raw_df["discharge"].values, output_dir=output_dir)
-    print("  ✓ Saved Flow Duration Curve")
+        # 2. Flow Duration Curve (Using full dataset)
+        vis.plot_flow_duration_curve(
+            raw_df["discharge"], 
+            output_dir=hydro_out_dir
+        )
+        print("  ✓ Flow duration curve plotted")
+        
+        # 3. Flood Frequency Curve
+        if "flood_frequency" in results:
+            vis.plot_flood_frequency(
+                annual_max, results["flood_frequency"],
+                output_dir=hydro_out_dir
+            )
+            print("  ✓ Flood frequency curve plotted")
+            
+        # 4. Advanced Catchment Physics
+        run_advanced_catchment_analysis(
+            df_in=raw_df, 
+            output_dir=hydro_out_dir, 
+            area_km2=basin_cfg.area_km2
+        )
 
-    # --- 3. Flood Frequency Curve ---
-    if "flood_frequency" in results:
-        plot_flood_frequency(annual_max, results["flood_frequency"], output_dir=output_dir)
-        print("  ✓ Saved Flood Frequency curve")
+        # ─── ML MODEL OUTPUTS ──────────────────────────────────────
+        ml_out_dir = str(ROOT / "outputs")
 
-    # --- 4. Per-Model Hydrographs & Scatter Plots ---
-    if all_test_preds:
-        for model_name, pred in all_test_preds.items():
-            obs = test_obs_per_model.get(model_name, y_test_np[:len(pred)])
-            obs = obs[:len(pred)]
-            dates = test_dates_per_model.get(model_name, test_X.index[:len(pred)])
-            dates = dates[:len(pred)]
-            metrics = results["models"].get(model_name, {}).get("test", {})
+        # 5. Model-specific Hydrographs & Scatters (Top 3 models + Ensemble)
+        # Add Ensemble to the trimmed dictionary for plotting
+        if "weighted" in results.get("ensemble", {}):
+            test_preds_trimmed["Weighted-Ensemble"] = ens_test_pred
+            results["models"]["Weighted-Ensemble"] = results["ensemble"]["weighted"]
 
-            # Per-model hydrograph
-            plot_model_hydrograph(dates, obs, pred, model_name,
-                                 metrics_dict=metrics, output_dir=output_dir)
-            print(f"  ✓ Saved hydrograph — {model_name}")
+        for model_name, pred in test_preds_trimmed.items():
+            metrics = results["models"].get(model_name, {}).get("test", None)
+            vis.plot_model_hydrograph(test_dates, y_test_ens, pred, model_name, metrics, output_dir=ml_out_dir)
+            vis.plot_model_scatter(y_test_ens, pred, model_name, metrics, output_dir=ml_out_dir)
+        print("  ✓ ML Hydrographs and scatter plots generated")
 
-            # Per-model scatter
-            plot_model_scatter(obs, pred, model_name,
-                              metrics_dict=metrics, output_dir=output_dir)
-            print(f"  ✓ Saved scatter — {model_name}")
+        # 6. Combined Model Comparisons
+        vis.plot_scatter_predictions(y_test_ens, test_preds_trimmed, output_dir=ml_out_dir)
+        vis.plot_error_violin(y_test_ens, test_preds_trimmed, output_dir=ml_out_dir)
+        print("  ✓ Combined error and comparison plots generated")
 
-        # --- 5. Combined scatter (all models) ---
-        # Use shortest common length
-        min_len = min(len(v) for v in all_test_preds.values())
-        obs_trimmed = y_test_np[:min_len]
-        preds_trimmed = {k: v[:min_len] for k, v in all_test_preds.items()}
+        # 7. CMIP6 Projections
+        if run_climate and "projections" in results.get("climate", {}):
+            # Convert list of dicts back to DataFrame for plotting
+            summary_df = pd.DataFrame(results["climate"]["projections"])
+            baseline_mean = raw_df["discharge"].mean()
+            vis.plot_cmip6_projections(summary_df, baseline_mean, output_dir=ml_out_dir)
+            print("  ✓ CMIP6 climate projection plots generated")
+            
+        # 8. Top 5 Feature Importance (Best Traditional Model)
+        if best_model is not None:
+            # Safely extract the raw sklearn estimator if wrapped in a custom class
+            sklearn_model = getattr(best_model, 'model', best_model)
+            vis.plot_top_5_features(
+                model=sklearn_model,
+                X_val=X_val_np,
+                y_val=y_val_np,
+                feature_names=list(df_features.columns),
+                model_name=best_model_name,
+                output_dir=ml_out_dir
+            )
 
-        plot_scatter_predictions(obs_trimmed, preds_trimmed, output_dir=output_dir)
-        print("  ✓ Saved combined scatter plot")
-
-        # --- 6. Violin plot ---
-        plot_error_violin(obs_trimmed, preds_trimmed, output_dir=output_dir)
-        print("  ✓ Saved error violin plot")
-
-    # ═══════════════════════════════════════════════════════════
-    # STEP 10: SAVE PREDICTIONS TO CSV
-    # ═══════════════════════════════════════════════════════════
-    print("\n" + "═" * 70)
-    print("  STEP 10: SAVING PREDICTIONS")
-    print("═" * 70)
-
-    # Save per-model test predictions as CSV for dashboard
-    for model_name, pred in all_test_preds.items():
-        obs = test_obs_per_model.get(model_name, y_test_np[:len(pred)])
-        obs = obs[:len(pred)]
-        dates = test_dates_per_model.get(model_name, test_X.index[:len(pred)])
-        dates = dates[:len(pred)]
-
-        pred_df = pd.DataFrame({
-            "date": dates,
-            "observed": obs,
-            "predicted": pred,
-        })
-        safe_name = model_name.replace(" ", "_").replace("/", "_")
-        pred_df.to_csv(OUTPUT_DIR / f"predictions_{safe_name}.csv", index=False)
-
-    print(f"  ✓ Saved {len(all_test_preds)} prediction CSVs to {OUTPUT_DIR}/")
-
-    # Save model list for dashboard
-    results["saved_models"] = {
-        name: str(MODEL_DIR / f"{name.lower().replace('-', '_')}.{'pt' if name in ['LSTM', 'PI-LSTM', 'A-GRU'] else 'joblib'}")
-        for name in results["models"].keys()
-    }
-
-    # ═══════════════════════════════════════════════════════════
-    # SUMMARY
-    # ═══════════════════════════════════════════════════════════
     elapsed = time.time() - start_time
     print("\n" + "═" * 70)
     print("  PIPELINE COMPLETE")
     print("═" * 70)
     print(f"  Total runtime: {elapsed:.1f}s ({elapsed/60:.1f} min)")
-    if use_real_cmip6 and run_climate:
-        print(f"  CMIP6 mode: Real data with QDM bias correction")
-    elif run_climate:
-        print(f"  CMIP6 mode: Synthetic delta-change")
 
-    print(f"\n  Outputs saved to: {OUTPUT_DIR}/")
-    print(f"  Models saved to:  {MODEL_DIR}/")
-
-    print("\n  ┌──────────────────┬────────┬────────┬────────┬────────┐")
-    print("  │ Model            │   NSE  │   KGE  │  RMSE  │   R    │")
-    print("  ├──────────────────┼────────┼────────┼────────┼────────┤")
-    for name, res in results["models"].items():
-        t = res["test"]
-        print(f"  │ {name:<16} │ {t['NSE']:6.4f} │ {t['KGE']:6.4f} │ {t['RMSE']:6.2f} │ {t['R']:6.4f} │")
-    for name, res in results["ensemble"].items():
-        if "test" in res:
-            t = res["test"]
-            label = f"Ens-{name}"
-            print(f"  │ {label:<16} │ {t['NSE']:6.4f} │ {t['KGE']:6.4f} │ {t['RMSE']:6.2f} │ {t['R']:6.4f} │")
-    print("  └──────────────────┴────────┴────────┴────────┴────────┘")
-
-    # Save results JSON
-    output_path = OUTPUT_DIR / "pipeline_results.json"
-
+    output_path = ROOT / "outputs" / "pipeline_results.json"
     def convert(obj):
-        if isinstance(obj, (np.integer,)):
-            return int(obj)
-        if isinstance(obj, (np.floating,)):
-            return float(obj)
-        if isinstance(obj, np.ndarray):
-            return obj.tolist()
-        if isinstance(obj, pd.Timestamp):
-            return str(obj)
+        if isinstance(obj, (np.integer,)): return int(obj)
+        if isinstance(obj, (np.floating,)): return float(obj)
+        if isinstance(obj, np.ndarray): return obj.tolist()
         return obj
 
     with open(output_path, "w") as f:
         json.dump(results, f, indent=2, default=convert)
     print(f"\n  Results saved to {output_path}")
 
-    # List all generated plots
-    plot_files = sorted(OUTPUT_DIR.glob("*.png"))
-    if plot_files:
-        print(f"\n  Generated {len(plot_files)} plots:")
-        for pf in plot_files:
-            print(f"    📊 {pf.name}")
-
     return results
-
+    
 
 if __name__ == "__main__":
     results = run_pipeline(
         use_synthetic=False,
-        precip_path="data/chirps_kabini_daily.csv",
-        discharge_path="data/discharge_daily_observed.csv",
-        temp_path=None,
         feature_combo="M1_full",
         run_traditional=True,
         run_deep=True,
         run_climate=True,
-        use_real_cmip6=True,
-        cmip6_dir="cmip6_downloads",
         pso_particles=10,
         pso_iterations=20,
         dl_epochs=50,

@@ -31,6 +31,11 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import warnings
 import json
+import re
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.inspection import permutation_importance
 
 from modules.bias_correction import MultiVariateBiasCorrector
 
@@ -114,12 +119,27 @@ class CMIP6RealProjector:
         return sorted(models)
 
     def _load_gcm_csv(self, model: str, scenario: str) -> Optional[pd.DataFrame]:
-        """Load a downloaded GCM CSV file."""
+        """Robustly load a GCM CSV file and set the date index."""
         path = self.cmip6_dir / scenario / f"{model}_{scenario}_daily.csv"
         if not path.exists():
             return None
-        df = pd.read_csv(path, index_col="date", parse_dates=True)
+        
+        # Read without assuming the index first
+        df = pd.read_csv(path)
+        
+        # Smart detection of the date column
+        if 'date' in df.columns:
+            date_col = 'date'
+        elif 'Unnamed: 0' in df.columns:
+            date_col = 'Unnamed: 0'
+        else:
+            date_col = df.columns[0] # Fallback: assume first column is the date
+            
+        # Convert and set the index
+        df[date_col] = pd.to_datetime(df[date_col])
+        df = df.set_index(date_col)
         df.index.name = "date"
+        
         return df
 
     # ─────────────────────────────────────────────────────────────
@@ -232,18 +252,6 @@ class CMIP6RealProjector:
         """
         Engineer the full feature set from bias-corrected climate data,
         using recursive prediction for discharge lag features.
-
-        This mirrors HydroFeatureEngineer but handles the absence of
-        observed discharge by predicting it step-by-step.
-
-        Args:
-            climate_df: Bias-corrected future climate DataFrame
-                        (columns: precip, tmax, tmin, [radiation, vapor_pressure])
-            model:      Trained ML model with .predict(X) method
-            scaler_X:   Optional scaler (if model expects scaled input)
-
-        Returns:
-            DataFrame with all features matching self.feature_columns
         """
         df = climate_df.copy()
 
@@ -305,29 +313,22 @@ class CMIP6RealProjector:
 
         # ── Recursive discharge prediction ──
         # Initialize discharge with a climatological estimate
-        # (use observed mean for the corresponding month as seed)
         obs_monthly_mean = self.obs_df["discharge"].groupby(
             self.obs_df.index.month
         ).mean()
         df["discharge"] = df.index.month.map(obs_monthly_mean)
 
-        # Discharge lag columns needed
-        discharge_lag_cols = [c for c in self.feature_columns if c.startswith("discharge_lag")]
-        discharge_rolling_cols = [c for c in self.feature_columns if c.startswith("discharge_rolling")]
+        # Ensure all columns exist before recursive steps so we can set/get loc safely
+        for col in self.feature_columns:
+            if col not in df.columns:
+                df[col] = 0.0
 
-        if discharge_lag_cols or discharge_rolling_cols:
-            df = self._recursive_predict(
-                df, model, scaler_X,
-                discharge_lag_cols, discharge_rolling_cols,
-            )
+        # Run recursive prediction if any discharge-based feature exists in the columns
+        if any("discharge_" in c for c in self.feature_columns):
+            df = self._recursive_predict(df, model, scaler_X)
 
         # ── Drop warmup period and select final features ──
         df = df.dropna(subset=[c for c in self.feature_columns if c in df.columns])
-
-        # Ensure all required feature columns exist
-        for col in self.feature_columns:
-            if col not in df.columns:
-                df[col] = 0.0  # fill missing features with 0
 
         return df
 
@@ -336,61 +337,56 @@ class CMIP6RealProjector:
         df: pd.DataFrame,
         model,
         scaler_X,
-        lag_cols: List[str],
-        rolling_cols: List[str],
     ) -> pd.DataFrame:
         """
-        Recursively predict discharge day-by-day, filling in lag features
-        as we go. This handles the chicken-and-egg problem: we need
-        discharge_lag1..7 to predict Q, but Q is what we're predicting.
-
-        Strategy:
-            1. Seed with climatological discharge for warmup (first 30 days)
-            2. For each subsequent day:
-                a. Compute discharge lags from previously predicted values
-                b. Assemble full feature vector
-                c. Predict Q_t using the trained model
-                d. Store Q_t for use in future lags
+        Dynamically predicts discharge day-by-day, calculating any required lags,
+        rolling means, or rolling standard deviations using regex feature extraction.
         """
         discharge_pred = df["discharge"].copy()
-
-        # Parse lag values needed
-        lags_needed = set()
-        for col in lag_cols:
-            lag_num = int(col.replace("discharge_lag", ""))
-            lags_needed.add(lag_num)
-
-        rolling_windows = set()
-        for col in rolling_cols:
-            window = int(col.replace("discharge_rolling", ""))
-            rolling_windows.add(window)
-
-        warmup = max(max(lags_needed, default=0), max(rolling_windows, default=0), 30)
         feature_cols = self.feature_columns
 
+        # Dynamically parse required windows using Regex
+        lags_needed = [int(re.search(r'\d+', col).group()) for col in feature_cols if "discharge_lag" in col and re.search(r'\d+', col)]
+        rolling_means = [int(re.search(r'\d+', col).group()) for col in feature_cols if "discharge_rolling" in col and re.search(r'\d+', col)]
+        rolling_stds = [int(re.search(r'\d+', col).group()) for col in feature_cols if "discharge_std" in col and re.search(r'\d+', col)]
+
+        max_lag = max(lags_needed, default=0)
+        max_roll = max(rolling_means + rolling_stds, default=0)
+        warmup = max(max_lag, max_roll, 30)
+
         for i in range(warmup, len(df)):
-            # Fill discharge lags
+            current_history = discharge_pred.iloc[:i]
+
+            # Update Lags
             for lag in lags_needed:
                 col = f"discharge_lag{lag}"
-                if i - lag >= 0:
-                    df.iloc[i, df.columns.get_loc(col)] = discharge_pred.iloc[i - lag]
+                df.iloc[i, df.columns.get_loc(col)] = current_history.iloc[-lag]
 
-            # Fill discharge rolling means
-            for window in rolling_windows:
+            # Update Rolling Means
+            for window in rolling_means:
                 col = f"discharge_rolling{window}"
-                start_idx = max(0, i - window)
-                df.iloc[i, df.columns.get_loc(col)] = discharge_pred.iloc[start_idx:i].mean()
+                df.iloc[i, df.columns.get_loc(col)] = current_history.iloc[-window:].mean()
 
-            # Assemble feature vector and predict
+            # Update Rolling Stds
+            for window in rolling_stds:
+                col = f"discharge_std{window}"
+                df.iloc[i, df.columns.get_loc(col)] = current_history.iloc[-window:].std()
+
+            # Assemble the exact feature vector expected by the model
             row = df.iloc[i]
-            X_row = np.array([[row[c] for c in feature_cols]], dtype=np.float32)
-
-            # Handle NaN in features (replace with 0)
+            
+            # Ensure strict column ordering matching the trained model
+            X_row = np.array([[row.get(c, 0.0) for c in feature_cols]], dtype=np.float32)
             X_row = np.nan_to_num(X_row, nan=0.0)
 
+            # Scale if necessary
+            if scaler_X is not None:
+                X_row = scaler_X.transform(X_row)
+
+            # Predict and clip to positive flow
             try:
                 pred = model.predict(X_row)[0]
-                pred = max(pred, 0.0)  # non-negative discharge
+                pred = max(pred, 0.0) 
             except Exception:
                 pred = discharge_pred.iloc[i]  # fallback to climatology
 
@@ -413,14 +409,6 @@ class CMIP6RealProjector:
             1. Bias-correct future climate data (if not already done)
             2. Engineer features with recursive Q prediction
             3. Predict discharge for each GCM × SSP × period
-
-        Args:
-            trained_model: Fitted model with .predict(X) method
-            scaler_X:      Scaler for input features (if model needs it)
-
-        Returns:
-            Dict: { scenario_key: { "discharge": array, "dates": array,
-                                     "features": DataFrame, "metadata": dict } }
         """
         if not self.corrected_futures:
             self.fit_bias_correction()
@@ -490,14 +478,6 @@ class CMIP6RealProjector:
     ) -> pd.DataFrame:
         """
         Create a summary table of all projections.
-
-        Args:
-            projections:        Output from generate_all_scenarios()
-            baseline_discharge: Observed discharge array for computing % change
-
-        Returns:
-            DataFrame with columns: GCM, SSP, Period, Mean_Q, Change_pct,
-                                    Max_Q, Min_Q, Std_Q
         """
         if baseline_discharge is None:
             baseline_discharge = self.obs_df["discharge"].values
@@ -538,9 +518,6 @@ class CMIP6RealProjector:
     ) -> pd.DataFrame:
         """
         Compute multi-model ensemble statistics per SSP × period.
-
-        Averages across GCMs to give ensemble mean, spread, and confidence
-        intervals for each SSP × period combination.
         """
         # Group projections by SSP_period
         grouped = {}

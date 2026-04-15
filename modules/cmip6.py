@@ -13,13 +13,6 @@ Variables downloaded (mapped to pipeline names):
   rsds        →  radiation       W/m² (kept as-is)
   hurs        →  vapor_pressure  RH% → hPa via Tetens
 
-Models (from config.py):
-  MRI-ESM2-0, CMCC-ESM2, MPI-ESM1-2-LR, INM-CM5-0, ACCESS-CM2
-
-Scenarios: historical | ssp245 | ssp585
-
-Source: Pangeo / Google Cloud CMIP6 (public, no auth required)
-Catalog: https://storage.googleapis.com/cmip6/pangeo-cmip6.json
 
 Usage:
   python cmip6_downloader.py --shapefile path/to/cauvery.shp
@@ -84,18 +77,17 @@ VARIABLES = {
 
 # Models from config.py
 MODELS = [
-    "MRI-ESM2-0",
-    "CMCC-ESM2",
-    "MPI-ESM1-2-LR",
-    "INM-CM5-0",
+    "EC-Earth3",
+    "EC-Earth3-Veg",
+    "MIROC6",
     "ACCESS-CM2",
 ]
 
 # Scenarios
 SCENARIOS = {
     "historical": ("1990-01-01", "2020-12-31"),
-    "ssp245":     ("2025-01-01", "2100-12-31"),
-    "ssp585":     ("2025-01-01", "2100-12-31"),
+    "ssp245":     ("2025-01-01", "2040-12-31"),
+    "ssp585":     ("2025-01-01", "2040-12-31"),
 }
 
 # Output directory

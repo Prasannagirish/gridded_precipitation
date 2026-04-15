@@ -11,6 +11,7 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import seaborn as sns
 from pathlib import Path
+from sklearn.inspection import permutation_importance
 
 plt.style.use("seaborn-v0_8-whitegrid")
 sns.set_context("paper", font_scale=1.2)
@@ -225,7 +226,7 @@ def plot_flow_duration_curve(discharge, output_dir="outputs"):
 def plot_flood_frequency(annual_max, flood_freq_dict, output_dir="outputs"):
     """Gumbel flood frequency curve with return periods."""
     Path(output_dir).mkdir(exist_ok=True, parents=True)
-    rp = [int(k.replace("T", "")) for k in flood_freq_dict.keys()]
+    rp = [int(''.join(filter(str.isdigit, k))) for k in flood_freq_dict.keys()]
     qvals = list(flood_freq_dict.values())
 
     # Plotting positions for observed annual maxima
@@ -321,3 +322,46 @@ def plot_cmip6_ensemble_summary(ensemble_df, output_dir="outputs"):
     plt.savefig(f"{output_dir}/cmip6_ensemble_summary.png", dpi=200)
     plt.close()
     
+
+
+def plot_top_5_features(model, X_val, y_val, feature_names, model_name="Model", output_dir="outputs"):
+    """
+    Calculates and plots the Top 5 most important features.
+    Uses native feature_importances_ for trees, and permutation importance for SVR/Deep Learning.
+    """
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    
+    importances = None
+    
+    # Strategy 1: Native Tree Importances (XGBoost, Random Forest)
+    if hasattr(model, "feature_importances_"):
+        importances = model.feature_importances_
+    
+    # Strategy 2: Permutation Importance (SVR, LSTMs via wrapper)
+    else:
+        print(f"  Calculating permutation importance for {model_name}...")
+        result = permutation_importance(
+            model, X_val, y_val, n_repeats=10, random_state=42, n_jobs=-1
+        )
+        importances = result.importances_mean
+
+    # Sort and slice Top 5
+    indices = np.argsort(importances)[-5:]
+    top_5_importances = importances[indices]
+    top_5_features = [feature_names[i] for i in indices]
+
+    # Generate Plot
+    plt.figure(figsize=(8, 5))
+    sns.barplot(x=top_5_importances, y=top_5_features, palette="viridis")
+    
+    plt.title(f"Top 5 Feature Importances ({model_name})", pad=15, fontweight='bold')
+    plt.xlabel("Relative Importance Score")
+    plt.ylabel("Hydrological Features")
+    plt.tight_layout()
+
+    # Save
+    save_path = Path(output_dir) / f"{model_name}_top5_features.png"
+    plt.savefig(save_path, dpi=300)
+    plt.close()
+    
+    print(f"  ✓ Top 5 feature graph saved to {save_path}")
