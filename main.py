@@ -196,6 +196,8 @@ def run_pipeline(
     # ═══════════════════════════════════════════════════════════
     # STEP 4A: Traditional ML Models (PSO-optimized)
     # ═══════════════════════════════════════════════════════════
+    trained_model_objs = {} # Initialize tracking dictionary
+    
     if run_traditional:
         print("\n" + "═" * 70)
         print("  STEP 4A: TRADITIONAL ML MODELS (PSO-OPTIMIZED)")
@@ -216,6 +218,7 @@ def run_pipeline(
         }
         all_val_preds["RF-PSO"] = rf_val_pred
         all_test_preds["RF-PSO"] = rf_test_pred
+        trained_model_objs["RF-PSO"] = rf # Save model
         print(f"\n  RF-PSO Test: {results['models']['RF-PSO']['test']}")
 
         # --- SVR-PSO ---
@@ -232,6 +235,7 @@ def run_pipeline(
         }
         all_val_preds["SVR-PSO"] = svr_val_pred
         all_test_preds["SVR-PSO"] = svr_test_pred
+        trained_model_objs["SVR-PSO"] = svr # Save model
         print(f"\n  SVR-PSO Test: {results['models']['SVR-PSO']['test']}")
 
         # --- XGBoost-PSO ---
@@ -248,6 +252,7 @@ def run_pipeline(
         }
         all_val_preds["XGBoost-PSO"] = xgb_val_pred
         all_test_preds["XGBoost-PSO"] = xgb_test_pred
+        trained_model_objs["XGBoost-PSO"] = xgb # Save model
         print(f"\n  XGBoost-PSO Test: {results['models']['XGBoost-PSO']['test']}")
 
     # ═══════════════════════════════════════════════════════════
@@ -467,6 +472,7 @@ def run_pipeline(
     # ═══════════════════════════════════════════════════════════
     # STEP 7: Climate Projections
     # ═══════════════════════════════════════════════════════════
+    all_projections = {}
     if run_climate:
         print("\n" + "═" * 70)
         print("  STEP 7: CMIP6 CLIMATE PROJECTIONS")
@@ -581,25 +587,38 @@ def run_pipeline(
         print("  ✓ Combined error and comparison plots generated")
 
         # 7. CMIP6 Projections
+        # 7. CMIP6 Projections (Updated Visualizations)
         if run_climate and "projections" in results.get("climate", {}):
-            # Convert list of dicts back to DataFrame for plotting
             summary_df = pd.DataFrame(results["climate"]["projections"])
             baseline_mean = raw_df["discharge"].mean()
             vis.plot_cmip6_projections(summary_df, baseline_mean, output_dir=ml_out_dir)
-            print("  ✓ CMIP6 climate projection plots generated")
+            print("  ✓ CMIP6 climate projection summary plots generated")
             
-        # 8. Top 5 Feature Importance (Best Traditional Model)
-        if best_model is not None:
-            # Safely extract the raw sklearn estimator if wrapped in a custom class
-            sklearn_model = getattr(best_model, 'model', best_model)
-            vis.plot_top_5_features(
-                model=sklearn_model,
-                X_val=X_val_np,
-                y_val=y_val_np,
-                feature_names=list(df_features.columns),
-                model_name=best_model_name,
-                output_dir=ml_out_dir
-            )
+            # Trigger the new Detailed, Yearly Aggregation, and Regime plots
+            if all_projections:
+                try:
+                    vis.plot_cmip6_timeseries_with_rainfall(all_projections, output_dir=ml_out_dir)
+                    vis.plot_cmip6_yearly_timeseries(all_projections, output_dir=ml_out_dir)
+                    vis.plot_cmip6_annual_regime(all_projections, output_dir=ml_out_dir)
+                except Exception as e:
+                    print(f"  ⚠ Could not generate advanced CMIP6 plots: {e}")
+            
+        # 8. Top 5 Feature Importance (ALL Traditional Models)
+        print("\n  Generating Feature Importance for all trained models...")
+        for model_name, model_obj in trained_model_objs.items():
+            try:
+                # Safely extract the raw sklearn estimator if wrapped in a custom class
+                sklearn_model = getattr(model_obj, 'model', model_obj)
+                vis.plot_top_5_features(
+                    model=sklearn_model,
+                    X_val=X_val_np,
+                    y_val=y_val_np,
+                    feature_names=list(df_features.columns),
+                    model_name=model_name,
+                    output_dir=ml_out_dir
+                )
+            except Exception as e:
+                print(f"  ⚠ Could not generate feature importance for {model_name}: {e}")
 
     elapsed = time.time() - start_time
     print("\n" + "═" * 70)

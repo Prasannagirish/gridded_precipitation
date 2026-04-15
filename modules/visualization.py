@@ -365,3 +365,181 @@ def plot_top_5_features(model, X_val, y_val, feature_names, model_name="Model", 
     plt.close()
     
     print(f"  ✓ Top 5 feature graph saved to {save_path}")
+    
+
+
+def plot_cmip6_timeseries_with_rainfall(all_projections, output_dir="outputs"):
+    """
+    Generates a dual-axis plot for each CMIP6 projection scenario, 
+    showing discharge as a line graph and rainfall as inverted bars.
+    """
+    out_dir = Path(output_dir) / "cmip6_detailed_forecasts"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    for key, data in all_projections.items():
+        dates = data["dates"]
+        discharge = data["discharge"]
+        
+        # Extract rainfall from the features dataframe
+        if "precip" in data["features"].columns:
+            precip = data["features"]["precip"]
+        else:
+            print(f"  ⚠ Skipping rainfall plot for {key}: 'precip' feature not found.")
+            continue
+
+        fig, ax1 = plt.subplots(figsize=(14, 6))
+
+        # ─── Primary Axis: Discharge ───
+        color_discharge = '#c0392b' # Deep red for SSPs
+        if 'ssp245' in key:
+            color_discharge = '#8e44ad' # Purple for SSP245
+            
+        ax1.set_xlabel('Date', fontweight='bold')
+        ax1.set_ylabel('Projected Discharge (m³/s)', color=color_discharge, fontweight='bold')
+        ax1.plot(dates, discharge, color=color_discharge, alpha=0.85, linewidth=1.2, label='Discharge')
+        ax1.tick_params(axis='y', labelcolor=color_discharge)
+        ax1.set_ylim(bottom=0) # Ensure discharge doesn't go below 0
+
+        # ─── Secondary Axis: Rainfall (Inverted) ───
+        ax2 = ax1.twinx()
+        color_precip = '#3498db' # Blue for rainfall
+        ax2.set_ylabel('Projected Rainfall (mm)', color=color_precip, fontweight='bold')
+        # Use width=1.0 for continuous daily bars without gaps
+        ax2.bar(dates, precip, color=color_precip, alpha=0.4, width=1.0, label='Rainfall')
+        ax2.tick_params(axis='y', labelcolor=color_precip)
+        
+        # Invert the y-axis so rainfall "hangs" from the top
+        ax2.set_ylim(bottom=0, top=max(precip)*3) # Multiply by 3 so rain only takes up top third of graph
+        ax2.invert_yaxis() 
+
+        # Formatting date axis
+        ax1.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
+        ax1.xaxis.set_major_locator(mdates.YearLocator(2)) # Tick every 2 years
+        plt.setp(ax1.xaxis.get_majorticklabels(), rotation=45, ha='right')
+
+        # Titles and Grids
+        parts = key.split('_')
+        gcm, ssp = parts[0], parts[-3] if len(parts) > 3 else "Unknown"
+        plt.title(f"Future Discharge vs Rainfall Projection: {gcm} ({ssp.upper()})", pad=15, fontsize=14, fontweight='bold')
+        
+        ax1.grid(True, alpha=0.2)
+        fig.tight_layout()
+
+        # Save Plot
+        save_path = out_dir / f"{key}_forecast_plot.png"
+        plt.savefig(save_path, dpi=300)
+        plt.close()
+        
+    print(f"  ✓ Detailed forecast plots saved to {out_dir}/")
+
+
+def plot_cmip6_yearly_timeseries(all_projections, output_dir="outputs"):
+    """
+    Plots the annual mean discharge and annual total rainfall for CMIP6 scenarios.
+    """
+    out_dir = Path(output_dir) / "cmip6_yearly_forecasts"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    for key, data in all_projections.items():
+        if "precip" not in data["features"].columns:
+            continue
+
+        # Build a temporary DataFrame for easy time-series resampling
+        df = pd.DataFrame({
+            "discharge": data["discharge"],
+            "precip": data["features"]["precip"].values
+        }, index=pd.to_datetime(data["dates"]))
+
+        # Aggregate: Mean for river flow, Sum for total rainfall
+        annual_df = df.resample('YE').agg({
+            'discharge': 'mean',
+            'precip': 'sum'
+        })
+        
+        # Shift index to just the year for cleaner X-axis plotting
+        annual_df.index = annual_df.index.year
+
+        fig, ax1 = plt.subplots(figsize=(12, 6))
+
+        # ─── Primary Axis: Annual Mean Discharge ───
+        color_discharge = '#8e44ad' if 'ssp245' in key else '#c0392b'
+        ax1.set_xlabel('Year', fontweight='bold')
+        ax1.set_ylabel('Annual Mean Discharge (m³/s)', color=color_discharge, fontweight='bold')
+        
+        # Using a line with markers for annual trends
+        ax1.plot(annual_df.index, annual_df['discharge'], marker='o', color=color_discharge, linewidth=2, markersize=6, label='Discharge')
+        ax1.tick_params(axis='y', labelcolor=color_discharge)
+        ax1.set_ylim(bottom=0) 
+
+        # ─── Secondary Axis: Total Annual Rainfall (Inverted Bars) ───
+        ax2 = ax1.twinx()
+        color_precip = '#3498db'
+        ax2.set_ylabel('Total Annual Rainfall (mm)', color=color_precip, fontweight='bold')
+        ax2.bar(annual_df.index, annual_df['precip'], color=color_precip, alpha=0.3, width=0.6, label='Rainfall')
+        ax2.tick_params(axis='y', labelcolor=color_precip)
+        
+        # Invert the y-axis so rainfall hangs from the top
+        ax2.set_ylim(bottom=0, top=annual_df['precip'].max() * 3) 
+        ax2.invert_yaxis() 
+
+        # Titles and Grid
+        parts = key.split('_')
+        gcm, ssp = parts[0], parts[-3] if len(parts) > 3 else "Unknown"
+        plt.title(f"Yearly Trend: Discharge vs Total Rainfall - {gcm} ({ssp.upper()})", pad=15, fontweight='bold')
+        
+        ax1.grid(True, alpha=0.3, linestyle='--')
+        fig.tight_layout()
+
+        # Save Plot
+        save_path = out_dir / f"{key}_yearly_trend.png"
+        plt.savefig(save_path, dpi=300)
+        plt.close()
+        
+    print(f"  ✓ Yearly aggregated forecast plots saved to {out_dir}/")
+
+
+def plot_cmip6_annual_regime(all_projections, output_dir="outputs"):
+    """
+    Plots the average annual regime (climatology) hydrograph.
+    Averages all ~30 years of daily predictions into a single 12-month typical year 
+    to see how peak monsoon flows change under different scenarios.
+    """
+    out_dir = Path(output_dir)
+    plt.figure(figsize=(12, 6))
+    
+    # We will use a seaborn color palette to handle multiple lines cleanly
+    colors = sns.color_palette("husl", len(all_projections))
+    
+    for (key, data), color in zip(all_projections.items(), colors):
+        df = pd.DataFrame({
+            "discharge": data["discharge"]
+        }, index=pd.to_datetime(data["dates"]))
+        
+        # Group by the month of the year to get the long-term monthly average
+        df['month'] = df.index.month
+        monthly_regime = df.groupby('month')['discharge'].mean()
+        
+        # Format label
+        parts = key.split('_')
+        label = f"{parts[0]} ({parts[-3]})" if len(parts) > 3 else key
+        
+        # Plot the regime curve
+        plt.plot(monthly_regime.index, monthly_regime.values, marker='s', linewidth=2, color=color, label=label)
+
+    plt.title("Long-Term Average Annual Regime Hydrograph (2020-2050)", pad=15, fontweight='bold', fontsize=14)
+    plt.xlabel("Month", fontweight='bold')
+    plt.ylabel("Average Monthly Discharge (m³/s)", fontweight='bold')
+    
+    # Force X-axis to show month names
+    months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+    plt.xticks(ticks=range(1, 13), labels=months)
+    
+    plt.grid(True, alpha=0.3)
+    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    plt.tight_layout()
+
+    save_path = out_dir / "cmip6_regime_hydrograph_comparison.png"
+    plt.savefig(save_path, dpi=300)
+    plt.close()
+    
+    print(f"  ✓ CMIP6 regime hydrograph (climatology) saved to {out_dir}/")
