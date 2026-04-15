@@ -149,7 +149,7 @@ class KabiniDataLoader:
 
     def get_static_features(self) -> dict:
         """Return static basin attributes for A-GRU (Paper 3 style)."""
-        from config import basin_cfg
+        from modules.config import basin_cfg
         return {
             "area_km2": basin_cfg.area_km2,
             "mean_elevation_m": basin_cfg.mean_elevation_m,

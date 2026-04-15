@@ -32,7 +32,7 @@ from typing import Dict, List, Optional, Tuple
 import warnings
 import json
 
-from bias_correction import MultiVariateBiasCorrector
+from modules.bias_correction import MultiVariateBiasCorrector
 
 
 class CMIP6RealProjector:

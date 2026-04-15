@@ -16,24 +16,24 @@ import joblib
 ROOT = Path(__file__).parent
 sys.path.insert(0, str(ROOT))
 
-from config import data_cfg, model_cfg, climate_cfg, basin_cfg, MODEL_DIR, OUTPUT_DIR
-from loader import KabiniDataLoader, train_val_test_split
-from engineer import (
+from modules.config import data_cfg, model_cfg, climate_cfg, basin_cfg, MODEL_DIR, OUTPUT_DIR
+from modules.loader import KabiniDataLoader, train_val_test_split
+from modules.engineer import (
     HydroFeatureEngineer, select_features,
     create_sequences, create_sequences_with_static,
 )
-from traditional_ml import RFModel, SVRModel, XGBoostModel
-from deep_learning import (
+from modules.traditional_ml import RFModel, SVRModel, XGBoostModel
+from modules.deep_learning import (
     LSTMNetwork, PhysicsInformedLSTM, PhysicsLoss, AdaptedGRU,
     DeepModelTrainer, build_dataloader, build_agru_dataloader,
 )
-from ensemble import WeightedEnsemble, StackingEnsemble
-from metrics import evaluate_all, evaluate_flow_regimes
-from hydro import (
+from modules.ensemble import WeightedEnsemble, StackingEnsemble
+from modules.metrics import evaluate_all, evaluate_flow_regimes
+from modules.hydro import (
     eckhardt_baseflow, gumbel_flood_frequency,
     compute_hydrological_signatures, flow_duration_curve,
 )
-from visualization import (
+from modules.visualization import (
     plot_model_hydrograph,
     plot_model_scatter,
     plot_scatter_predictions,
@@ -502,7 +502,7 @@ def run_pipeline(
                 print(f"\n  Falling back to synthetic delta-change method...")
                 use_real_cmip6 = False
             else:
-                from cmip6_projector import CMIP6RealProjector
+                from modules.cmip6_projector import CMIP6RealProjector
 
                 projector = CMIP6RealProjector(
                     cmip6_dir=str(cmip6_path),
@@ -562,7 +562,7 @@ def run_pipeline(
             print(f"\n  Mode: SYNTHETIC delta-change (legacy)")
             print(f"  Using {best_model_name} for climate projections")
 
-            from cmip6_projector import CMIP6RealProjector
+            from modules.cmip6_projector import CMIP6RealProjector
 
             # Generate synthetic CMIP6-style projections for demo
             print("  Generating synthetic climate scenarios for demonstration...")

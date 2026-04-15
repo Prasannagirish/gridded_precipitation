@@ -5,7 +5,7 @@ Stacking, weighted averaging, and adaptive weighting (Paper 2: Yao et al. approa
 import numpy as np
 from sklearn.linear_model import Ridge
 from typing import Dict, List
-from metrics import nse, kge
+from modules.metrics import nse, kge
 
 
 class WeightedEnsemble:
