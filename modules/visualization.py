@@ -150,105 +150,169 @@ def plot_error_violin(obs, pred_dict, output_dir="outputs"):
 # ════════════════════════════════════════════════════════════
 def plot_eckhardt_filter(dates, precip, discharge, baseflow, output_dir="outputs"):
     """
-    Eckhardt baseflow separation with:
-    - Bottom Y-axis: Total discharge + baseflow shading
-    - Top Y-axis: Inverted rainfall hyetograph (bars hanging from top)
+    Plots the Eckhardt baseflow separation with a clean, inverted rainfall hyetograph.
     """
-    Path(output_dir).mkdir(exist_ok=True, parents=True)
-    fig, ax1 = plt.subplots(figsize=(14, 7))
-
-    # ── Bottom axis: Discharge & Baseflow ──
-    ax1.plot(dates, discharge, color="#1f77b4", lw=1.5, label="Total Discharge")
-    ax1.fill_between(dates, 0, baseflow, color="#2ca02c", alpha=0.4, label="Baseflow (Eckhardt)")
-    ax1.plot(dates, baseflow, color="#175c17", lw=1.0)
-    ax1.set_xlabel("Date")
-    ax1.set_ylabel("Flow (cumecs)", color="#1f77b4", fontweight="bold")
-    ax1.tick_params(axis="y", labelcolor="#1f77b4")
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    
+    fig, ax1 = plt.subplots(figsize=(14, 6))
+    
+    # ─── Primary Axis: Discharge and Baseflow ───
+    ax1.plot(dates, discharge, color='#2E86C1', linewidth=1.2, label='Total Discharge')
+    ax1.fill_between(dates, baseflow, 0, color='#27AE60', alpha=0.6, label='Baseflow (Eckhardt)')
+    
+    ax1.set_xlabel('Year', fontweight='bold')
+    ax1.set_ylabel('Flow (m³/s)', color='#2E86C1', fontweight='bold')
+    ax1.tick_params(axis='y', labelcolor='#2E86C1')
     ax1.set_ylim(bottom=0)
-
-    # ── Top axis: Inverted rainfall ──
+    
+    # ─── Secondary Axis: Rainfall (Inverted) ───
     ax2 = ax1.twinx()
-    ax2.bar(dates, precip, width=1.0, color="#7f7f7f", alpha=0.55, label="Precipitation")
-    ax2.set_ylabel("Rainfall (mm)", color="#7f7f7f", fontweight="bold")
-    ax2.tick_params(axis="y", labelcolor="#7f7f7f")
-    # INVERT the rainfall axis so bars hang from top
-    max_precip = np.nanmax(precip) if np.nanmax(precip) > 0 else 1.0
-    ax2.set_ylim(max_precip * 3, 0)
+    # Use a slightly darker grey so it stands out, but make it semi-transparent
+    ax2.bar(dates, precip, color='#7F8C8D', alpha=0.5, width=1.0, label='Precipitation')
+    ax2.set_ylabel('Rainfall (mm)', color='#7F8C8D', fontweight='bold')
+    
+    # Invert the y-axis and multiply max by 3 so rain only occupies the top third
+    ax2.set_ylim(bottom=0, top=precip.max() * 3) 
     ax2.invert_yaxis()
-
-    # Combined legend
+    ax2.tick_params(axis='y', labelcolor='#7F8C8D')
+    
+    # ─── X-Axis Date Formatting (Fixes the black blob) ───
+    ax1.xaxis.set_major_locator(mdates.YearLocator(2)) # Tick every 2 years
+    ax1.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+    plt.setp(ax1.xaxis.get_majorticklabels(), rotation=45, ha='right')
+    
+    # Combine legends from both axes
     lines1, labels1 = ax1.get_legend_handles_labels()
     lines2, labels2 = ax2.get_legend_handles_labels()
-    ax1.legend(lines1 + lines2, labels1 + labels2, loc="center right", frameon=True, facecolor="white")
-
-    plt.title("Baseflow Separation (Eckhardt Filter) with Rainfall Hyetograph")
-    ax1.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
-    ax1.xaxis.set_major_locator(mdates.MonthLocator(interval=2))
-    fig.autofmt_xdate()
-    plt.tight_layout()
-    plt.savefig(f"{output_dir}/eckhardt_separation.png", dpi=200)
+    ax1.legend(lines1 + lines2, labels1 + labels2, loc='center right')
+    
+    plt.title('Baseflow Separation (Eckhardt Filter) with Rainfall Hyetograph', pad=15, fontweight='bold', fontsize=14)
+    ax1.grid(True, alpha=0.3)
+    fig.tight_layout()
+    
+    save_path = out_dir / "eckhardt_separation.png"
+    plt.savefig(save_path, dpi=300)
     plt.close()
 
-
 # ════════════════════════════════════════════════════════════
-#  FLOW DURATION CURVE
+#  FLOOD DURATION CURVE
 # ════════════════════════════════════════════════════════════
 def plot_flow_duration_curve(discharge, output_dir="outputs"):
-    """Flow Duration Curve: exceedance probability vs discharge."""
-    Path(output_dir).mkdir(exist_ok=True, parents=True)
-    sorted_q = np.sort(discharge)[::-1]
-    n = len(sorted_q)
-    exceedance = np.arange(1, n + 1) / (n + 1) * 100
-
-    fig, ax = plt.subplots(figsize=(10, 5))
-    ax.semilogy(exceedance, sorted_q, color="#1f77b4", lw=2)
-    ax.fill_between(exceedance, sorted_q, alpha=0.15, color="#1f77b4")
-    ax.set_xlabel("Exceedance Probability (%)")
-    ax.set_ylabel("Discharge (cumecs, log scale)")
-    ax.set_title("Flow Duration Curve")
+    """
+    Plots a clean Flow Duration Curve on a log scale with Q50 and Q90 annotations.
+    """
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Calculate exceedance probability
+    sorted_flow = np.sort(discharge)[::-1]
+    ranks = np.arange(1, len(sorted_flow) + 1)
+    prob = (ranks / (len(sorted_flow) + 1)) * 100
+    
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.plot(prob, sorted_flow, color='#3498db', linewidth=2)
+    
+    # Log scale for accurate hydrological representation
+    ax.set_yscale('log')
     ax.set_xlim(0, 100)
-    ax.grid(True, which="both", alpha=0.3)
+    
+    # ─── Annotations for Q50 and Q90 ───
+    # Find the exact values for the 50% and 90% exceedance marks
+    idx_50 = np.argmin(np.abs(prob - 50))
+    idx_90 = np.argmin(np.abs(prob - 90))
+    val_50 = sorted_flow[idx_50]
+    val_90 = sorted_flow[idx_90]
+    
+    # Add horizontal dashed lines
+    ax.axhline(y=val_50, color='gray', linestyle='--', alpha=0.6)
+    ax.axhline(y=val_90, color='gray', linestyle='--', alpha=0.6)
+    
+    # Add text and arrows
+    ax.annotate(f'Q50 = {val_50:.1f}', 
+                xy=(50, val_50), xytext=(55, val_50 * 1.5),
+                arrowprops=dict(arrowstyle="->", color='gray'))
+                
+    ax.annotate(f'Q90 = {val_90:.1f}', 
+                xy=(90, val_90), xytext=(75, val_90 * 0.5), # Put text below line for Q90
+                arrowprops=dict(arrowstyle="->", color='gray'))
 
-    for pct, label in [(5, "Q5 (high)"), (50, "Q50 (median)"), (95, "Q95 (low)")]:
-        idx = min(int(pct / 100 * n), n - 1)
-        ax.annotate(f"{label}\n{sorted_q[idx]:.1f}", xy=(pct, sorted_q[idx]),
-                    fontsize=9, ha="center", va="bottom",
-                    arrowprops=dict(arrowstyle="->", color="gray"))
-
-    plt.tight_layout()
-    plt.savefig(f"{output_dir}/flow_duration_curve.png", dpi=200)
+    ax.set_xlabel('Exceedance Probability (%)', fontweight='bold')
+    ax.set_ylabel('Discharge (m³/s, log scale)', fontweight='bold')
+    plt.title('Flow Duration Curve', pad=15, fontweight='bold', fontsize=14)
+    
+    ax.grid(True, which="both", ls="-", alpha=0.2)
+    fig.tight_layout()
+    
+    save_path = out_dir / "flow_duration_curve.png"
+    plt.savefig(save_path, dpi=300)
     plt.close()
-
-
+# ════════════════════════════════════════════════════════════
+#  FLOOD FREQUENCY CURVE
+# ════════════════════════════════════════════════════════════
 # ════════════════════════════════════════════════════════════
 #  FLOOD FREQUENCY CURVE
 # ════════════════════════════════════════════════════════════
 def plot_flood_frequency(annual_max, flood_freq_dict, output_dir="outputs"):
-    """Gumbel flood frequency curve with return periods."""
-    Path(output_dir).mkdir(exist_ok=True, parents=True)
-    rp = [int(''.join(filter(str.isdigit, k))) for k in flood_freq_dict.keys()]
-    qvals = list(flood_freq_dict.values())
+    """
+    Plots the empirical annual maxima against the theoretical Gumbel distribution.
+    """
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Plotting positions for observed annual maxima
-    n = len(annual_max)
-    sorted_am = np.sort(annual_max)[::-1]
-    plotting_rp = (n + 1) / np.arange(1, n + 1)
+    # 1. Empirical plotting positions (Weibull)
+    sorted_max = np.sort(annual_max)[::-1]
+    n = len(sorted_max)
+    ranks = np.arange(1, n + 1)
+    return_periods = (n + 1) / ranks
 
-    fig, ax = plt.subplots(figsize=(9, 5))
-    ax.plot(rp, qvals, "o-", color="#D32F2F", lw=2, markersize=8, label="Gumbel Fit")
-    ax.scatter(plotting_rp, sorted_am, color="#1f77b4", s=40, alpha=0.7,
-              zorder=5, label="Observed Annual Max")
-    ax.set_xscale("log")
-    ax.set_xlabel("Return Period (years)")
-    ax.set_ylabel("Discharge (cumecs)")
-    ax.set_title("Gumbel Flood Frequency Analysis")
-    ax.legend(frameon=True)
-    ax.grid(True, which="both", alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(f"{output_dir}/flood_frequency.png", dpi=200)
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    # Plot empirical data
+    ax.scatter(return_periods, sorted_max, color='#e74c3c', s=40, label='Observed Annual Maxima', zorder=5)
+
+    # 2. Plot theoretical (Gumbel) from dictionary
+    gumbel_t = []
+    gumbel_q = []
+    for k, v in flood_freq_dict.items():
+        try:
+            # Parse 'Q2yr', 'Q50yr', etc., to get the numeric return period
+            t = int(k.replace('Q', '').replace('yr', ''))
+            gumbel_t.append(t)
+            gumbel_q.append(v)
+        except ValueError:
+            pass
+
+    if gumbel_t and gumbel_q:
+        # Sort values by return period to draw a clean line
+        sort_idx = np.argsort(gumbel_t)
+        gumbel_t = np.array(gumbel_t)[sort_idx]
+        gumbel_q = np.array(gumbel_q)[sort_idx]
+        
+        ax.plot(gumbel_t, gumbel_q, color='#2c3e50', linestyle='--', linewidth=2, label='Gumbel Theoretical Curve')
+
+        # Annotate the theoretical points
+        for t, q in zip(gumbel_t, gumbel_q):
+            ax.annotate(f"{q:.0f}", (t, q), textcoords="offset points", xytext=(0,10), ha='center', fontsize=9, color='#2c3e50')
+
+    # Formatting
+    ax.set_xscale('log')
+    ax.set_xlabel('Return Period (Years, Log Scale)', fontweight='bold')
+    ax.set_ylabel('Peak Discharge (m³/s)', fontweight='bold')
+    plt.title('Flood Frequency Analysis (Gumbel Distribution)', pad=15, fontweight='bold', fontsize=14)
+
+    # Add custom tick labels for standard return periods on the log axis
+    xticks = [1.1, 2, 5, 10, 25, 50, 100]
+    ax.set_xticks(xticks)
+    ax.set_xticklabels(xticks)
+
+    ax.grid(True, which="both", ls="-", alpha=0.2)
+    ax.legend(frameon=True, facecolor="white")
+    fig.tight_layout()
+
+    save_path = out_dir / "flood_frequency.png"
+    plt.savefig(save_path, dpi=300)
     plt.close()
-
-
 # ════════════════════════════════════════════════════════════
 #  CMIP6 PROJECTION PLOTS
 # ════════════════════════════════════════════════════════════
