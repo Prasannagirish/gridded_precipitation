@@ -603,7 +603,41 @@ def run_pipeline(
                 except Exception as e:
                     print(f"  ⚠ Could not generate advanced CMIP6 plots: {e}")
             
-        # 8. Top 5 Feature Importance (ALL Traditional Models)
+        # 8. Model Performance Radar Chart
+        try:
+            # Collect test-set metrics for every model that ran.
+            # Raw values are passed directly — visualization.py auto-scales each panel.
+            all_model_metrics = {
+                **results.get("models", {}),
+                # Flatten ensemble sub-keys to the same shape as model entries
+                **{
+                    ("Wtd-Ens"   if k == "weighted" else
+                     "Stack-Ens" if k == "stacking"  else k): v
+                    for k, v in results.get("ensemble", {}).items()
+                },
+            }
+            radar_raw = {
+                name: data["test"]
+                for name, data in all_model_metrics.items()
+                if "test" in data and "NSE" in data["test"]
+            }
+            if radar_raw:
+                radar_metrics = {
+                    model: {
+                        "NSE":   round(float(vals["NSE"]),   3),
+                        "KGE":   round(float(vals["KGE"]),   3),
+                        "R²":    round(float(vals["R2"]),    3),
+                        "PBIAS": round(abs(float(vals["PBIAS"])), 2),
+                        "RMSE":  round(float(vals["RMSE"]),  2),
+                    }
+                    for model, vals in radar_raw.items()
+                }
+                vis.plot_model_radar(radar_metrics, output_dir=ml_out_dir)
+                print("  ✓ Model performance radar chart generated")
+        except Exception as e:
+            print(f"  ⚠ Could not generate radar chart: {e}")
+
+        # 9. Top 5 Feature Importance (ALL Traditional Models)
         print("\n  Generating Feature Importance for all trained models...")
         for model_name, model_obj in trained_model_objs.items():
             try:
